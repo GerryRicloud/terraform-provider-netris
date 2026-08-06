@@ -22,6 +22,7 @@ import (
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/validation"
@@ -151,6 +152,31 @@ func Resource() *schema.Resource {
 						},
 					},
 				},
+			},
+			"vnet_gateway": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"postfix": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "V-Net name suffix (e.g. 'frontend' for V-Net named <cluster>-frontend).",
+						},
+						"gateway": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "Gateway CIDR (e.g. '10.100.1.1/24' or '2001:db8::1/64'). Multiple entries per postfix supported for dual-stack.",
+						},
+					},
+				},
+				Description: "Set of V-Net gateway entries. Each entry specifies a gateway CIDR for a V-Net identified by its postfix. Multiple entries with the same postfix enable dual-stack.",
+			},
+			"vnet_ids": {
+				Type:        schema.TypeMap,
+				Computed:    true,
+				Elem:        &schema.Schema{Type: schema.TypeString},
+				Description: "Map of V-Net postfix to V-Net ID. Populated automatically from V-Nets created by the cluster template.",
 			},
 		},
 		CustomizeDiff: func(d *schema.ResourceDiff, m interface{}) error {
@@ -286,16 +312,41 @@ func resourceCreate(d *schema.ResourceData, m interface{}) error {
 		sortedServers = append(sortedServers, servercluster.Servers{ID: sortedServer})
 	}
 
+	vpcID := d.Get("vpcid").(int)
+	var vpc *servercluster.IDName
+	if vpcID > 0 {
+		vpc = &servercluster.IDName{ID: vpcID}
+	}
+
+	var ipv4Gateways []servercluster.GatewayInput
+	var ipv6Gateways []servercluster.GatewayInput
+	if gwSet, ok := d.GetOk("vnet_gateway"); ok {
+		for _, item := range gwSet.(*schema.Set).List() {
+			m := item.(map[string]interface{})
+			gw := servercluster.GatewayInput{
+				Postfix: m["postfix"].(string),
+				Address: m["gateway"].(string),
+			}
+			if strings.Contains(gw.Address, ":") {
+				ipv6Gateways = append(ipv6Gateways, gw)
+			} else {
+				ipv4Gateways = append(ipv4Gateways, gw)
+			}
+		}
+	}
+
 	serverclusterAdd := &servercluster.ServerClusterW{
-		Name:                    d.Get("name").(string),
-		Admin:                   servercluster.IDName{ID: d.Get("adminid").(int)},
-		Site:                    servercluster.IDName{ID: d.Get("siteid").(int)},
-		VPC:                     servercluster.IDName{ID: d.Get("vpcid").(int)},
-		VPCList:                 vpcMappings,
-		SrvClusterTemplate:      servercluster.IDName{ID: d.Get("templateid").(int)},
-		SrvClusterTemplateVLANs: expandVLANs(d),
-		Tags:                    tags,
-		Servers:                 sortedServers,
+		Name:                           d.Get("name").(string),
+		Admin:                          servercluster.IDName{ID: d.Get("adminid").(int)},
+		Site:                           servercluster.IDName{ID: d.Get("siteid").(int)},
+		VPC:                            vpc,
+		VPCList:                        vpcMappings,
+		SrvClusterTemplate:             servercluster.IDName{ID: d.Get("templateid").(int)},
+		SrvClusterTemplateVLANs:        expandVLANs(d),
+		SrvClusterTemplateIPv4Gateways: ipv4Gateways,
+		SrvClusterTemplateIPv6Gateways: ipv6Gateways,
+		Tags:                           tags,
+		Servers:                        sortedServers,
 	}
 
 	if id := d.Get("dynamicvpcgroupid").(int); id > 0 {
@@ -339,6 +390,7 @@ func resourceCreate(d *schema.ResourceData, m interface{}) error {
 	}
 
 	d.SetId(strconv.Itoa(idStruct.ID))
+
 	return nil
 }
 
@@ -418,6 +470,56 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		}
 	}
 
+	// Read V-Net gateways for drift detection.
+	clusterName := apiServerCluster.Name
+	configuredGWs := d.Get("vnet_gateway").(*schema.Set).List()
+	configuredPostfixes := make(map[string]bool)
+	for _, item := range configuredGWs {
+		configuredPostfixes[item.(map[string]interface{})["postfix"].(string)] = true
+	}
+
+	vnetIDs := make(map[string]string)
+	gwEntries := []interface{}{}
+
+	for _, v := range apiServerCluster.Resources.VNets {
+		postfix := v.Name
+		if strings.HasPrefix(v.Name, clusterName+"-") {
+			postfix = strings.TrimPrefix(v.Name, clusterName+"-")
+		}
+		vnetIDs[postfix] = strconv.Itoa(v.ID)
+
+		if !configuredPostfixes[postfix] {
+			continue
+		}
+
+		// Always use the detail API — the list endpoint only returns IPv4
+		// gateways, so dual-stack V-Nets would be missing their IPv6 entries.
+		var gateways []string
+		detail, err := clientset.VNet().GetByID(v.ID)
+		if err != nil {
+			log.Printf("[WARN] fetching V-Net %d detail for gateway read: %v", v.ID, err)
+		} else {
+			for _, gw := range detail.Gateways {
+				gateways = append(gateways, gw.Prefix)
+			}
+		}
+		for _, gw := range gateways {
+			gwEntries = append(gwEntries, map[string]interface{}{
+				"postfix": postfix,
+				"gateway": gw,
+			})
+		}
+	}
+
+	err = d.Set("vnet_ids", vnetIDs)
+	if err != nil {
+		return err
+	}
+	err = d.Set("vnet_gateway", gwEntries)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -485,6 +587,49 @@ func resourceUpdate(d *schema.ResourceData, m interface{}) error {
 
 	if reply.StatusCode != 200 {
 		return fmt.Errorf("%s", reply.Data)
+	}
+
+	if d.HasChange("vnet_gateway") {
+		old, new := d.GetChange("vnet_gateway")
+		oldByPostfix := groupGatewaysByPostfix(old.(*schema.Set).List())
+		newByPostfix := groupGatewaysByPostfix(new.(*schema.Set).List())
+		clusterName := d.Get("name").(string)
+		vnetIDsMap := d.Get("vnet_ids").(map[string]interface{})
+
+		resolveVNetID := func(postfix string) (int, error) {
+			if idStr, ok := vnetIDsMap[postfix]; ok {
+				id, _ := strconv.Atoi(idStr.(string))
+				if id > 0 {
+					return id, nil
+				}
+			}
+			return findVNetByName(clientset, clusterName+"-"+postfix)
+		}
+
+		for postfix, gateways := range newByPostfix {
+			vnetID, err := resolveVNetID(postfix)
+			if err != nil {
+				return fmt.Errorf("finding V-Net %q: %w", clusterName+"-"+postfix, err)
+			}
+			if err := replaceVNetGateways(clientset, vnetID, gateways); err != nil {
+				return fmt.Errorf("updating gateways for V-Net %q: %w", clusterName+"-"+postfix, err)
+			}
+		}
+
+		// Clear gateways for postfixes removed from config.
+		for postfix := range oldByPostfix {
+			if _, ok := newByPostfix[postfix]; ok {
+				continue
+			}
+			vnetID, err := resolveVNetID(postfix)
+			if err != nil {
+				log.Printf("[WARN] could not find V-Net %q to clear gateways: %v", clusterName+"-"+postfix, err)
+				continue
+			}
+			if err := replaceVNetGateways(clientset, vnetID, nil); err != nil {
+				return fmt.Errorf("clearing gateways for V-Net %q: %w", clusterName+"-"+postfix, err)
+			}
+		}
 	}
 
 	return nil
