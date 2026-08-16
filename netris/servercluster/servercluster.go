@@ -29,6 +29,7 @@ import (
 	"github.com/netrisai/netriswebapi/http"
 	api "github.com/netrisai/netriswebapi/v2"
 	"github.com/netrisai/netriswebapi/v2/types/servercluster"
+	"github.com/netrisai/netriswebapi/v2/types/vnet"
 )
 
 func Resource() *schema.Resource {
@@ -172,6 +173,40 @@ func Resource() *schema.Resource {
 					},
 				},
 				Description: "Set of V-Net gateway entries. Each entry specifies a gateway CIDR for a V-Net identified by its postfix. Multiple entries with the same postfix enable dual-stack.",
+			},
+			"vnet_dhcp_relay": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"postfix": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "V-Net name suffix (e.g. 'frontend').",
+						},
+						"enabled": {
+							Type:        schema.TypeBool,
+							Required:    true,
+							Description: "Enable DHCP relay on the V-Net.",
+						},
+						"vpc_id": {
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Description: "VPC ID where the DHCP servers reside.",
+						},
+						"primary": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "Primary DHCP relay target address.",
+						},
+						"secondary": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "Secondary DHCP relay target address.",
+						},
+					},
+				},
+				Description: "Set of V-Net DHCP relay entries. Configures DHCP relay on auto-created V-Nets to forward DHCP requests to a remote DHCP server (e.g. MAAS rackd). Applied as a post-creation V-Net update.",
 			},
 			"vnet_ids": {
 				Type:        schema.TypeMap,
@@ -426,6 +461,34 @@ func resourceCreate(d *schema.ResourceData, m interface{}) error {
 
 	d.SetId(strconv.Itoa(idStruct.ID))
 
+	// DHCP relay cannot be set inline at cluster creation (the server cluster
+	// API doesn't accept it). Read back the cluster to get V-Net IDs, then
+	// apply relay config as a post-creation V-Net update.
+	if relaySet, ok := d.GetOk("vnet_dhcp_relay"); ok {
+		relayByPostfix := groupDhcpRelayByPostfix(relaySet.(*schema.Set).List())
+		clusterName := d.Get("name").(string)
+
+		apiCluster, err := clientset.ServerCluster().GetByID(idStruct.ID)
+		if err != nil {
+			return fmt.Errorf("reading back cluster %d for DHCP relay: %w", idStruct.ID, err)
+		}
+		if apiCluster == nil {
+			return fmt.Errorf("cluster %d not found after creation", idStruct.ID)
+		}
+
+		for _, v := range apiCluster.Resources.VNets {
+			postfix := v.Name
+			if strings.HasPrefix(v.Name, clusterName+"-") {
+				postfix = strings.TrimPrefix(v.Name, clusterName+"-")
+			}
+			if relay, ok := relayByPostfix[postfix]; ok {
+				if err := replaceVNetDhcpRelay(clientset, v.ID, relay); err != nil {
+					return fmt.Errorf("setting DHCP relay for V-Net %q: %w", v.Name, err)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -509,17 +572,23 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		}
 	}
 
-	// Read V-Net gateways for drift detection.
+	// Read V-Net gateways and DHCP relay for drift detection.
 	clusterName := apiServerCluster.Name
 	configuredGWs := d.Get("vnet_gateway").(*schema.Set).List()
 	configuredPostfixes := make(map[string]bool)
 	for _, item := range configuredGWs {
 		configuredPostfixes[item.(map[string]interface{})["postfix"].(string)] = true
 	}
+	configuredRelays := d.Get("vnet_dhcp_relay").(*schema.Set).List()
+	configuredRelayPostfixes := make(map[string]bool)
+	for _, item := range configuredRelays {
+		configuredRelayPostfixes[item.(map[string]interface{})["postfix"].(string)] = true
+	}
 
 	vnetIDs := make(map[string]string)
 	gwEntries := []interface{}{}
 	vnetDetails := []interface{}{}
+	relayEntries := []interface{}{}
 
 	for _, v := range apiServerCluster.Resources.VNets {
 		postfix := v.Name
@@ -540,6 +609,24 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 			vxlanID = detail.VxlanID
 			for _, gw := range detail.Gateways {
 				gateways = append(gateways, gw.Prefix)
+			}
+
+			// Read DHCP relay for configured postfixes
+			if configuredRelayPostfixes[postfix] && detail.DhcpRelay != nil {
+				entry := map[string]interface{}{
+					"postfix": postfix,
+					"enabled": detail.DhcpRelay.Enabled,
+				}
+				if detail.DhcpRelay.Vpc != nil {
+					entry["vpc_id"] = detail.DhcpRelay.Vpc.ID
+				}
+				if detail.DhcpRelay.PrimaryAddr != nil {
+					entry["primary"] = *detail.DhcpRelay.PrimaryAddr
+				}
+				if detail.DhcpRelay.SecondaryAddr != nil {
+					entry["secondary"] = *detail.DhcpRelay.SecondaryAddr
+				}
+				relayEntries = append(relayEntries, entry)
 			}
 		}
 		// Populate vnets computed block
@@ -575,6 +662,10 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		return err
 	}
 	err = d.Set("vnets", vnetDetails)
+	if err != nil {
+		return err
+	}
+	err = d.Set("vnet_dhcp_relay", relayEntries)
 	if err != nil {
 		return err
 	}
@@ -703,6 +794,49 @@ func resourceUpdate(d *schema.ResourceData, m interface{}) error {
 			}
 			if err := replaceVNetGateways(clientset, vnetID, nil); err != nil {
 				return fmt.Errorf("clearing gateways for V-Net %q: %w", clusterName+"-"+postfix, err)
+			}
+		}
+	}
+
+	if d.HasChange("vnet_dhcp_relay") {
+		old, new := d.GetChange("vnet_dhcp_relay")
+		oldByPostfix := groupDhcpRelayByPostfix(old.(*schema.Set).List())
+		newByPostfix := groupDhcpRelayByPostfix(new.(*schema.Set).List())
+		clusterName := d.Get("name").(string)
+		vnetIDsMap := d.Get("vnet_ids").(map[string]interface{})
+
+		resolveVNetID := func(postfix string) (int, error) {
+			if idStr, ok := vnetIDsMap[postfix]; ok {
+				id, _ := strconv.Atoi(idStr.(string))
+				if id > 0 {
+					return id, nil
+				}
+			}
+			return findVNetByName(clientset, clusterName+"-"+postfix)
+		}
+
+		for postfix, relay := range newByPostfix {
+			vnetID, err := resolveVNetID(postfix)
+			if err != nil {
+				return fmt.Errorf("finding V-Net %q: %w", clusterName+"-"+postfix, err)
+			}
+			if err := replaceVNetDhcpRelay(clientset, vnetID, relay); err != nil {
+				return fmt.Errorf("updating DHCP relay for V-Net %q: %w", clusterName+"-"+postfix, err)
+			}
+		}
+
+		// Clear DHCP relay for postfixes removed from config.
+		for postfix := range oldByPostfix {
+			if _, ok := newByPostfix[postfix]; ok {
+				continue
+			}
+			vnetID, err := resolveVNetID(postfix)
+			if err != nil {
+				log.Printf("[WARN] could not find V-Net %q to clear DHCP relay: %v", clusterName+"-"+postfix, err)
+				continue
+			}
+			if err := replaceVNetDhcpRelay(clientset, vnetID, &vnet.VNetDhcpRelay{Enabled: false}); err != nil {
+				return fmt.Errorf("clearing DHCP relay for V-Net %q: %w", clusterName+"-"+postfix, err)
 			}
 		}
 	}

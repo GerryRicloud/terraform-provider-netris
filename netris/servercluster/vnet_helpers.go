@@ -46,6 +46,9 @@ func replaceVNetGateways(clientset *api.Clientset, vnetID int, gateways []string
 	if err != nil {
 		return fmt.Errorf("fetching V-Net %d: %w", vnetID, err)
 	}
+	if detail == nil {
+		return fmt.Errorf("V-Net %d not found", vnetID)
+	}
 
 	update := detailedToVNetUpdate(detail)
 	gwList := make([]vnet.VNetUpdateGateway, len(gateways))
@@ -76,6 +79,60 @@ func groupGatewaysByPostfix(entries []interface{}) map[string][]string {
 		postfix := m["postfix"].(string)
 		gateway := m["gateway"].(string)
 		result[postfix] = append(result[postfix], gateway)
+	}
+	return result
+}
+
+// strPtr returns a pointer to s, or nil if s is empty.
+func strPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// replaceVNetDhcpRelay sets or clears DHCP relay on a V-Net, preserving
+// all other fields (ports, sites, tags, gateways, etc.).
+func replaceVNetDhcpRelay(clientset *api.Clientset, vnetID int, relay *vnet.VNetDhcpRelay) error {
+	detail, err := clientset.VNet().GetByID(vnetID)
+	if err != nil {
+		return fmt.Errorf("fetching V-Net %d: %w", vnetID, err)
+	}
+	if detail == nil {
+		return fmt.Errorf("V-Net %d not found", vnetID)
+	}
+
+	update := detailedToVNetUpdate(detail)
+	update.DhcpRelay = relay
+
+	reply, err := clientset.VNet().Update(vnetID, &update)
+	if err != nil {
+		return fmt.Errorf("updating V-Net DHCP relay: %w", err)
+	}
+	if reply.StatusCode != 200 {
+		return fmt.Errorf("updating V-Net DHCP relay (HTTP %d): %s", reply.StatusCode, string(reply.Data))
+	}
+
+	log.Printf("[DEBUG] replaceVNetDhcpRelay: V-Net %d relay set", vnetID)
+	return nil
+}
+
+// groupDhcpRelayByPostfix builds a map of postfix → VNetDhcpRelay from
+// vnet_dhcp_relay set entries.
+func groupDhcpRelayByPostfix(entries []interface{}) map[string]*vnet.VNetDhcpRelay {
+	result := make(map[string]*vnet.VNetDhcpRelay)
+	for _, item := range entries {
+		m := item.(map[string]interface{})
+		postfix := m["postfix"].(string)
+		relay := &vnet.VNetDhcpRelay{
+			Enabled:       m["enabled"].(bool),
+			PrimaryAddr:   strPtr(m["primary"].(string)),
+			SecondaryAddr: strPtr(m["secondary"].(string)),
+		}
+		if vpcID := m["vpc_id"].(int); vpcID > 0 {
+			relay.Vpc = &vnet.IDName{ID: vpcID}
+		}
+		result[postfix] = relay
 	}
 	return result
 }
