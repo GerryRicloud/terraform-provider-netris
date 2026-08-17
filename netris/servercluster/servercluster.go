@@ -208,6 +208,31 @@ func Resource() *schema.Resource {
 				},
 				Description: "Set of V-Net DHCP relay entries. Configures DHCP relay on auto-created V-Nets to forward DHCP requests to a remote DHCP server (e.g. MAAS rackd). Applied as a post-creation V-Net update.",
 			},
+			"vnet_ports": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"postfix": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "V-Net name suffix (e.g. 'frontend').",
+						},
+						"port": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "Switch port name in 'port@switch' format (e.g. 'swp10@leaf-01').",
+						},
+						"untagged": {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							Default:     true,
+							Description: "Add the port as an untagged (access mode) member. Default true.",
+						},
+					},
+				},
+				Description: "Set of static switch port members for auto-created V-Nets. Binds ports of hosts outside server cluster membership (e.g. management servers like MAAS rackd) to a template V-Net. Merged into the V-Net port list without disturbing dynamically programmed members. Multiple ports from different switches form an EVPN multihoming group automatically.",
+			},
 			"vnet_ids": {
 				Type:        schema.TypeMap,
 				Computed:    true,
@@ -489,7 +514,37 @@ func resourceCreate(d *schema.ResourceData, m interface{}) error {
 		}
 	}
 
-	return nil
+	// Static port members (e.g. management servers) cannot be declared at
+	// cluster creation either. Merge them into the template V-Nets after
+	// creation, preserving dynamically programmed members.
+	if portsSet, ok := d.GetOk("vnet_ports"); ok {
+		portsByPostfix := groupPortsByPostfix(portsSet.(*schema.Set).List())
+		clusterName := d.Get("name").(string)
+
+		apiCluster, err := clientset.ServerCluster().GetByID(idStruct.ID)
+		if err != nil {
+			return fmt.Errorf("reading back cluster %d for static ports: %w", idStruct.ID, err)
+		}
+		if apiCluster == nil {
+			return fmt.Errorf("cluster %d not found after creation", idStruct.ID)
+		}
+
+		for _, v := range apiCluster.Resources.VNets {
+			postfix := v.Name
+			if strings.HasPrefix(v.Name, clusterName+"-") {
+				postfix = strings.TrimPrefix(v.Name, clusterName+"-")
+			}
+			if ports, ok := portsByPostfix[postfix]; ok {
+				if err := mergeVNetPorts(clientset, v.ID, ports, nil); err != nil {
+					return fmt.Errorf("adding static ports to V-Net %q: %w", v.Name, err)
+				}
+			}
+		}
+	}
+
+	// Read back so Computed attributes (vnets, vnet_ids) are populated for
+	// same-apply consumers of the module outputs; Create itself never sets them.
+	return resourceRead(d, m)
 }
 
 func resourceRead(d *schema.ResourceData, m interface{}) error {
@@ -585,10 +640,23 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		configuredRelayPostfixes[item.(map[string]interface{})["postfix"].(string)] = true
 	}
 
+	// Static port members keyed by postfix → "port@switch" name, for drift
+	// detection limited to the declared set (dynamic members are ignored).
+	configuredPortsByPostfix := make(map[string]map[string]map[string]interface{})
+	for _, item := range d.Get("vnet_ports").(*schema.Set).List() {
+		entry := item.(map[string]interface{})
+		postfix := entry["postfix"].(string)
+		if configuredPortsByPostfix[postfix] == nil {
+			configuredPortsByPostfix[postfix] = make(map[string]map[string]interface{})
+		}
+		configuredPortsByPostfix[postfix][entry["port"].(string)] = entry
+	}
+
 	vnetIDs := make(map[string]string)
 	gwEntries := []interface{}{}
 	vnetDetails := []interface{}{}
 	relayEntries := []interface{}{}
+	portEntries := []interface{}{}
 
 	for _, v := range apiServerCluster.Resources.VNets {
 		postfix := v.Name
@@ -628,6 +696,22 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 				}
 				relayEntries = append(relayEntries, entry)
 			}
+
+			// Static port member drift: emit declared ports that are present
+			// in the V-Net with their live state. Missing ports are omitted,
+			// producing a plan diff that re-adds them.
+			if declared, ok := configuredPortsByPostfix[postfix]; ok {
+				for _, p := range detail.Ports {
+					name := fmt.Sprintf("%s@%s", p.Port, p.SwitchName)
+					if _, ok := declared[name]; ok {
+						portEntries = append(portEntries, map[string]interface{}{
+							"postfix":  postfix,
+							"port":     name,
+							"untagged": p.Untagged,
+						})
+					}
+				}
+			}
 		}
 		// Populate vnets computed block
 		gwIP := ""
@@ -666,6 +750,10 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		return err
 	}
 	err = d.Set("vnet_dhcp_relay", relayEntries)
+	if err != nil {
+		return err
+	}
+	err = d.Set("vnet_ports", portEntries)
 	if err != nil {
 		return err
 	}
@@ -841,7 +929,45 @@ func resourceUpdate(d *schema.ResourceData, m interface{}) error {
 		}
 	}
 
-	return nil
+	if d.HasChange("vnet_ports") {
+		old, new := d.GetChange("vnet_ports")
+		oldByPostfix := groupPortsByPostfix(old.(*schema.Set).List())
+		newByPostfix := groupPortsByPostfix(new.(*schema.Set).List())
+		clusterName := d.Get("name").(string)
+		vnetIDsMap := d.Get("vnet_ids").(map[string]interface{})
+
+		resolveVNetID := func(postfix string) (int, error) {
+			if idStr, ok := vnetIDsMap[postfix]; ok {
+				id, _ := strconv.Atoi(idStr.(string))
+				if id > 0 {
+					return id, nil
+				}
+			}
+			return findVNetByName(clientset, clusterName+"-"+postfix)
+		}
+
+		// Union of postfixes touched on either side. Removed entries are
+		// passed as the drop list so their ports leave the V-Net.
+		postfixes := make(map[string]bool)
+		for postfix := range oldByPostfix {
+			postfixes[postfix] = true
+		}
+		for postfix := range newByPostfix {
+			postfixes[postfix] = true
+		}
+		for postfix := range postfixes {
+			vnetID, err := resolveVNetID(postfix)
+			if err != nil {
+				return fmt.Errorf("finding V-Net %q: %w", clusterName+"-"+postfix, err)
+			}
+			if err := mergeVNetPorts(clientset, vnetID, newByPostfix[postfix], oldByPostfix[postfix]); err != nil {
+				return fmt.Errorf("updating static ports on V-Net %q: %w", clusterName+"-"+postfix, err)
+			}
+		}
+	}
+
+	// Read back to refresh Computed attributes after in-place updates.
+	return resourceRead(d, m)
 }
 
 func resourceExists(d *schema.ResourceData, m interface{}) (bool, error) {
