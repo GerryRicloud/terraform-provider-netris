@@ -27,6 +27,8 @@ import (
 	"github.com/netrisai/netriswebapi/v2/types/inventory"
 
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+
+	"github.com/netrisai/terraform-provider-netris/netris/serverclustermember"
 )
 
 func Resource() *schema.Resource {
@@ -320,6 +322,14 @@ func resourceDelete(d *schema.ResourceData, m interface{}) error {
 	clientset := m.(*api.Clientset)
 
 	id, _ := strconv.Atoi(d.Id())
+
+	// bm-extension parks released hosts in a ServerCluster; deleting the
+	// inventory server while still a member leaves the controller with a
+	// dangling reference. No-op when the server holds no membership.
+	if err := serverclustermember.RemoveServerFromAllClusters(clientset, id); err != nil {
+		return err
+	}
+
 	reply, err := clientset.Inventory().Delete("server", id)
 	if err != nil {
 		return err

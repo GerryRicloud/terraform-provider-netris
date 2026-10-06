@@ -228,3 +228,48 @@ func resourceExists(d *schema.ResourceData, m interface{}) (bool, error) {
 
 	return clusterExists(clientset, clusterID), nil
 }
+
+// RemoveServerFromAllClusters evicts the server from every ServerCluster
+// holding it. The server resource calls this before its inventory delete:
+// bm-extension parks released hosts in a cluster, so deleting the server
+// while still a member leaves the controller with a dangling reference.
+// No-op when the server holds no membership.
+func RemoveServerFromAllClusters(clientset *api.Clientset, serverID int) error {
+	// The list response carries no members, so membership is read one
+	// cluster at a time.
+	clusters, err := clientset.ServerCluster().Get()
+	if err != nil {
+		return err
+	}
+	for _, c := range clusters {
+		if c == nil || c.ID <= 0 {
+			continue
+		}
+		if err := evictFromCluster(clientset, c.ID, serverID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func evictFromCluster(clientset *api.Clientset, clusterID, serverID int) error {
+	mu := clusterMutex(clusterID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// An error here is propagated, not skipped: a cluster that vanished
+	// between list and read makes the retry's re-list drop it, while a
+	// transient API failure silently skipped would delete the server with
+	// membership dangling.
+	cluster, err := getCluster(clientset, clusterID)
+	if err != nil {
+		return err
+	}
+
+	members := memberIDs(cluster)
+	if members[serverID] {
+		delete(members, serverID)
+		return updateMembers(clientset, cluster, members)
+	}
+	return nil
+}
