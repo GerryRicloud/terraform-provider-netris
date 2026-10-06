@@ -111,6 +111,7 @@ func Provider() terraform.ResourceProvider {
 			"netris_servercluster":         servercluster.Resource(),
 			"netris_servercluster_member":  serverclustermember.Resource(),
 			"netris_serverclustertemplate": serverclustertemplate.Resource(),
+			"netris_vnet_ports":            servercluster.ResourceVNetPorts(),
 		},
 		DataSourcesMap: map[string]*schema.Resource{
 			"netris_dynamic_vpc_group":     dynamicvpcgroup.DataResource(),

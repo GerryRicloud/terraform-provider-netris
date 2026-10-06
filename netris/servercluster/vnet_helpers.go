@@ -39,6 +39,24 @@ func findVNetByName(clientset *api.Clientset, name string) (int, error) {
 	return 0, fmt.Errorf("V-Net %q not found", name)
 }
 
+// vnetExists reports whether the V-Net still exists. GetByID maps every
+// non-200 response to an error, so it cannot distinguish a deleted V-Net
+// from a transient failure; gone-detection lists V-Nets and scans for the
+// id instead — a successful list without the id is unambiguously gone,
+// while an error propagates for the caller to retry rather than guess.
+func vnetExists(clientset *api.Clientset, vnetID int) (bool, error) {
+	vnets, err := clientset.VNet().Get()
+	if err != nil {
+		return false, fmt.Errorf("listing V-Nets: %w", err)
+	}
+	for _, v := range vnets {
+		if v.ID == vnetID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // replaceVNetGateways replaces all gateways on a V-Net with the given gateways,
 // preserving all other fields (ports, sites, tags, etc.).
 // Supports multiple gateways per V-Net for dual-stack (IPv4 + IPv6).
