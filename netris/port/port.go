@@ -53,6 +53,11 @@ func Resource() *schema.Resource {
 				Required:    true,
 				Description: "ID of tenant. Users of this tenant will be permitted to manage port",
 			},
+			"initial_tenant_id": {
+				Type:        schema.TypeInt,
+				Computed:    true,
+				Description: "Tenant that owned the port before this resource adopted it. Destroy hands the port back to this tenant",
+			},
 			"breakout": {
 				Default:      "off",
 				ValidateFunc: validateBreakout,
@@ -151,6 +156,11 @@ func resourceCreate(d *schema.ResourceData, m interface{}) error {
 		return fmt.Errorf("Coudn't find port '%s'", name)
 	}
 
+	// The pre-adoption owner, so Delete can hand the port back to it.
+	if err := d.Set("initial_tenant_id", hwPort.Tenant.ID); err != nil {
+		return err
+	}
+
 	portUpdate := portDefault()
 	portUpdate.Description = description
 	portUpdate.Tenant = port.IDName{ID: tenantID}
@@ -207,7 +217,7 @@ func resourceCreate(d *schema.ResourceData, m interface{}) error {
 	log.Println("[DEBUG]", string(reply.Data))
 
 	if reply.StatusCode != 200 {
-		return fmt.Errorf(string(reply.Data))
+		return fmt.Errorf("%s", reply.Data)
 	}
 
 	d.SetId(strconv.Itoa(hwPort.ID))
@@ -359,7 +369,7 @@ func resourceUpdate(d *schema.ResourceData, m interface{}) error {
 	log.Println("[DEBUG]", string(reply.Data))
 
 	if reply.StatusCode != 200 {
-		return fmt.Errorf(string(reply.Data))
+		return fmt.Errorf("%s", reply.Data)
 	}
 
 	d.SetId(strconv.Itoa(hwPort.ID))
@@ -371,29 +381,70 @@ func resourceDelete(d *schema.ResourceData, m interface{}) error {
 
 	name := d.Get("name").(string)
 	tenantID := d.Get("tenantid").(int)
+	initialTenantID := d.Get("initial_tenant_id").(int)
 
 	id, _ := strconv.Atoi(d.Id())
 
-	portUpdate := portDefault()
-	portUpdate.Description = name
-	portUpdate.Tenant = port.IDName{ID: tenantID}
-
-	js, _ := json.Marshal(portUpdate)
-	log.Println("[DEBUG]", string(js))
-
-	reply, err := clientset.Port().Update(id, portUpdate)
+	// The controller's free-up clears links and reservations bound to
+	// the port. It does not change port ownership, so the tenant
+	// hand-back is a separate explicit edit below.
+	reply, err := clientset.Port().FreeUP([]*port.IDName{{ID: id, Name: name}})
 	if err != nil {
 		log.Println("[DEBUG]", err)
 		return err
 	}
 
-	js, _ = json.Marshal(reply)
+	js, _ := json.Marshal(reply)
 	log.Println("[DEBUG]", string(js))
 
 	log.Println("[DEBUG]", string(reply.Data))
 
 	if reply.StatusCode != 200 {
-		return fmt.Errorf(string(reply.Data))
+		return fmt.Errorf("%s", reply.Data)
+	}
+
+	if initialTenantID == 0 {
+		// State from before initial_tenant_id was captured: the
+		// pre-adoption owner is unknown, so the port stays where it is.
+		log.Printf("[WARN] netris_port '%s' (%d): no initial tenant in state, skipping tenant hand-back", name, id)
+		d.SetId("")
+		return nil
+	}
+
+	if initialTenantID != tenantID {
+		// Mirror of Create: the same default-settings edit, with the
+		// tenant set to the pre-adoption owner instead.
+		portUpdate := portDefault()
+		portUpdate.Tenant = port.IDName{ID: initialTenantID}
+
+		reply, err = clientset.Port().Update(id, portUpdate)
+		if err != nil {
+			log.Println("[DEBUG]", err)
+			return err
+		}
+
+		js, _ = json.Marshal(reply)
+		log.Println("[DEBUG]", string(js))
+
+		log.Println("[DEBUG]", string(reply.Data))
+
+		if reply.StatusCode != 200 {
+			return fmt.Errorf("%s", reply.Data)
+		}
+
+		// Verify the hand-back persisted: the port must now be owned
+		// by the tenant it had before this resource adopted it.
+		hwPort, err := clientset.Port().GetByID(id)
+		if err != nil {
+			log.Println("[DEBUG]", err)
+			return err
+		}
+		if hwPort == nil {
+			return fmt.Errorf("port '%s' (%d) disappeared during tenant hand-back", name, id)
+		}
+		if hwPort.Tenant.ID != initialTenantID {
+			return fmt.Errorf("port '%s' (%d) is still owned by tenant %d after hand-back", name, id, hwPort.Tenant.ID)
+		}
 	}
 
 	d.SetId("")
