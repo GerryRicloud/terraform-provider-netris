@@ -43,6 +43,7 @@ import (
 	"github.com/netrisai/terraform-provider-netris/netris/routemap"
 	"github.com/netrisai/terraform-provider-netris/netris/server"
 	"github.com/netrisai/terraform-provider-netris/netris/servercluster"
+	"github.com/netrisai/terraform-provider-netris/netris/serverclustermember"
 	"github.com/netrisai/terraform-provider-netris/netris/serverclustertemplate"
 	"github.com/netrisai/terraform-provider-netris/netris/site"
 	"github.com/netrisai/terraform-provider-netris/netris/softgate"
@@ -106,6 +107,7 @@ func Provider() terraform.ResourceProvider {
 			"netris_vpc":                   vpc.Resource(),
 			"netris_lag":                   lag.Resource(),
 			"netris_servercluster":         servercluster.Resource(),
+			"netris_servercluster_member":  serverclustermember.Resource(),
 			"netris_serverclustertemplate": serverclustertemplate.Resource(),
 		},
 		DataSourcesMap: map[string]*schema.Resource{
