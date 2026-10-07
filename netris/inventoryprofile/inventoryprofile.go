@@ -836,13 +836,17 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 	if err != nil {
 		return err
 	}
-	err = d.Set("ntpservers", strings.Split(profile.NTPServers, ","))
-	if err != nil {
-		return err
+	if (d.Get("ntpservers") != nil && len(d.Get("ntpservers").([]interface{})) > 0) || profile.NTPServers != "" {
+		err = d.Set("ntpservers", strings.Split(profile.NTPServers, ","))
+		if err != nil {
+			return err
+		}
 	}
-	err = d.Set("dnsservers", strings.Split(profile.DNSServers, ","))
-	if err != nil {
-		return err
+	if (d.Get("dnsservers") != nil && len(d.Get("dnsservers").([]interface{})) > 0) || profile.DNSServers != "" {
+		err = d.Set("dnsservers", strings.Split(profile.DNSServers, ","))
+		if err != nil {
+			return err
+		}
 	}
 
 	var customRules []map[string]interface{}
