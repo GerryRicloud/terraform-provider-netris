@@ -126,7 +126,8 @@ func Resource() *schema.Resource {
 				},
 			},
 			"servers": {
-				Required: true,
+				Optional: true,
+				Computed: true,
 				Type:     schema.TypeSet,
 				Elem: &schema.Schema{
 					Type: schema.TypeInt,
@@ -535,10 +536,26 @@ func resourceUpdate(d *schema.ResourceData, m interface{}) error {
 		tags = append(tags, tag.(string))
 	}
 
-	serversList := d.Get("servers").(*schema.Set).List()
 	servers := []int{}
-	for _, server := range serversList {
-		servers = append(servers, server.(int))
+	if d.HasChange("servers") {
+		serversList := d.Get("servers").(*schema.Set).List()
+		for _, server := range serversList {
+			servers = append(servers, server.(int))
+		}
+	} else {
+		// `servers` is bm-extension-owned when the config does not declare
+		// it; PUT the controller's live members instead of the refresh-time
+		// snapshot so a concurrent membership change is not reverted.
+		current, err := clientset.ServerCluster().GetByID(serverclusterID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("server cluster %s not found", d.Id())
+		}
+		for _, server := range current.Servers {
+			servers = append(servers, server.ID)
+		}
 	}
 
 	sort.Ints(servers)
