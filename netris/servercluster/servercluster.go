@@ -179,6 +179,40 @@ func Resource() *schema.Resource {
 				Elem:        &schema.Schema{Type: schema.TypeString},
 				Description: "Map of V-Net postfix to V-Net ID. Populated automatically from V-Nets created by the cluster template.",
 			},
+			"vnets": {
+				Type:        schema.TypeList,
+				Computed:    true,
+				Description: "V-Net details auto-created by this cluster (read-only). Each entry has postfix, vlan_id, vxlan_id, gateway_ip, and prefix.",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"postfix": {
+							Type:        schema.TypeString,
+							Computed:    true,
+							Description: "V-Net name postfix (e.g. 'frontend').",
+						},
+						"vlan_id": {
+							Type:        schema.TypeInt,
+							Computed:    true,
+							Description: "VLAN ID assigned by Netris.",
+						},
+						"vxlan_id": {
+							Type:        schema.TypeInt,
+							Computed:    true,
+							Description: "VXLAN ID assigned by Netris.",
+						},
+						"gateway_ip": {
+							Type:        schema.TypeString,
+							Computed:    true,
+							Description: "Gateway CIDR (e.g. '10.0.0.1/24'). Empty if no gateway configured.",
+						},
+						"prefix": {
+							Type:        schema.TypeString,
+							Computed:    true,
+							Description: "Subnet prefix (same as gateway_ip, includes CIDR). Empty if no gateway configured.",
+						},
+					},
+				},
+			},
 		},
 		CustomizeDiff: func(d *schema.ResourceDiff, m interface{}) error {
 			// A read can derive the top-level group from per-object mappings.
@@ -403,6 +437,10 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 	apiServerCluster, err := clientset.ServerCluster().GetByID(id)
 
 	if err != nil {
+		return err
+	}
+	if apiServerCluster == nil {
+		d.SetId("")
 		return nil
 	}
 
@@ -481,6 +519,7 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 
 	vnetIDs := make(map[string]string)
 	gwEntries := []interface{}{}
+	vnetDetails := []interface{}{}
 
 	for _, v := range apiServerCluster.Resources.VNets {
 		postfix := v.Name
@@ -489,26 +528,41 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		}
 		vnetIDs[postfix] = strconv.Itoa(v.ID)
 
-		if !configuredPostfixes[postfix] {
-			continue
-		}
-
-		// Always use the detail API — the list endpoint only returns IPv4
-		// gateways, so dual-stack V-Nets would be missing their IPv6 entries.
+		// Always fetch full V-Net detail — needed for vlan_id (vnets block)
+		// and for dual-stack gateway reading (vnet_gateway drift).
 		var gateways []string
+		var vlanID, vxlanID int
 		detail, err := clientset.VNet().GetByID(v.ID)
 		if err != nil {
-			log.Printf("[WARN] fetching V-Net %d detail for gateway read: %v", v.ID, err)
-		} else {
+			log.Printf("[WARN] fetching V-Net %d detail: %v", v.ID, err)
+		} else if detail != nil {
+			vlanID = detail.Vlan
+			vxlanID = detail.VxlanID
 			for _, gw := range detail.Gateways {
 				gateways = append(gateways, gw.Prefix)
 			}
 		}
-		for _, gw := range gateways {
-			gwEntries = append(gwEntries, map[string]interface{}{
-				"postfix": postfix,
-				"gateway": gw,
-			})
+		// Populate vnets computed block
+		gwIP := ""
+		if len(gateways) > 0 {
+			gwIP = gateways[0]
+		}
+		vnetDetails = append(vnetDetails, map[string]interface{}{
+			"postfix":    postfix,
+			"vlan_id":    vlanID,
+			"vxlan_id":   vxlanID,
+			"gateway_ip": gwIP,
+			"prefix":     gwIP,
+		})
+
+		// Populate vnet_gateway drift entries for configured postfixes
+		if configuredPostfixes[postfix] {
+			for _, gw := range gateways {
+				gwEntries = append(gwEntries, map[string]interface{}{
+					"postfix": postfix,
+					"gateway": gw,
+				})
+			}
 		}
 	}
 
@@ -517,6 +571,10 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		return err
 	}
 	err = d.Set("vnet_gateway", gwEntries)
+	if err != nil {
+		return err
+	}
+	err = d.Set("vnets", vnetDetails)
 	if err != nil {
 		return err
 	}

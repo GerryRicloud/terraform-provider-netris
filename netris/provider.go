@@ -54,6 +54,7 @@ import (
 	"github.com/netrisai/terraform-provider-netris/netris/userrole"
 	"github.com/netrisai/terraform-provider-netris/netris/vnet"
 	"github.com/netrisai/terraform-provider-netris/netris/vpc"
+	"github.com/netrisai/terraform-provider-netris/netris/vpcpeering"
 )
 
 func Provider() terraform.ResourceProvider {
@@ -105,6 +106,7 @@ func Provider() terraform.ResourceProvider {
 			"netris_acltwozero":            acl2.Resource(),
 			"netris_dhcp_option_set":       dhcpoptionset.Resource(),
 			"netris_vpc":                   vpc.Resource(),
+			"netris_vpc_peering":            vpcpeering.Resource(),
 			"netris_lag":                   lag.Resource(),
 			"netris_servercluster":         servercluster.Resource(),
 			"netris_servercluster_member":  serverclustermember.Resource(),
