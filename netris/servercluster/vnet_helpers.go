@@ -19,6 +19,7 @@ package servercluster
 import (
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 
 	api "github.com/netrisai/netriswebapi/v2"
@@ -70,11 +71,7 @@ func replaceVNetGateways(clientset *api.Clientset, vnetID int, gateways []string
 	}
 
 	update := detailedToVNetUpdate(detail)
-	gwList := make([]vnet.VNetUpdateGateway, len(gateways))
-	for i, gw := range gateways {
-		gwList[i] = vnet.VNetUpdateGateway{Prefix: gw}
-	}
-	update.Gateways = gwList
+	update.Gateways = mergeGatewayList(update.Gateways, gateways)
 
 	reply, err := clientset.VNet().Update(vnetID, &update)
 	if err != nil {
@@ -88,6 +85,38 @@ func replaceVNetGateways(clientset *api.Clientset, vnetID int, gateways []string
 	return nil
 }
 
+// mergeGatewayList is the V-Net's gateway list for the wanted prefixes: the
+// gateways it has already, in the controller's own order and with every
+// field they have (vlan, DHCP), then the new ones, which take the vlan of
+// the V-Net's first gateway — the same segment. So adding a second, third or
+// fourth gateway leaves the existing ones as they were, the one the cluster
+// created first included.
+func mergeGatewayList(existing []vnet.VNetUpdateGateway, wanted []string) []vnet.VNetUpdateGateway {
+	want := make(map[string]bool, len(wanted))
+	for _, prefix := range wanted {
+		want[prefix] = true
+	}
+	vlan := ""
+	if len(existing) > 0 {
+		vlan = existing[0].Vlan
+	}
+	out := make([]vnet.VNetUpdateGateway, 0, len(wanted))
+	kept := make(map[string]bool, len(existing))
+	for _, g := range existing {
+		if want[g.Prefix] && !kept[g.Prefix] {
+			out = append(out, g)
+			kept[g.Prefix] = true
+		}
+	}
+	for _, prefix := range wanted {
+		if !kept[prefix] {
+			out = append(out, vnet.VNetUpdateGateway{Prefix: prefix, Vlan: vlan})
+			kept[prefix] = true
+		}
+	}
+	return out
+}
+
 // groupGatewaysByPostfix groups vnet_gateway set entries by postfix.
 // Input: list of {postfix, gateway} maps from a TypeSet.
 // Output: map of postfix → list of gateway CIDR strings.
@@ -98,6 +127,22 @@ func groupGatewaysByPostfix(entries []interface{}) map[string][]string {
 		postfix := m["postfix"].(string)
 		gateway := m["gateway"].(string)
 		result[postfix] = append(result[postfix], gateway)
+	}
+	return result
+}
+
+// mergeGateways is every gateway per postfix: vnet_gateway's (the ones the
+// cluster creates) first, then vnet_extra_gateway's, each group sorted so
+// the V-Net update is the same whatever order the sets list them in.
+func mergeGateways(primary, extra []interface{}) map[string][]string {
+	result := groupGatewaysByPostfix(primary)
+	for postfix, gws := range result {
+		sort.Strings(gws)
+		result[postfix] = gws
+	}
+	for postfix, gws := range groupGatewaysByPostfix(extra) {
+		sort.Strings(gws)
+		result[postfix] = append(result[postfix], gws...)
 	}
 	return result
 }

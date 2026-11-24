@@ -174,6 +174,25 @@ func Resource() *schema.Resource {
 				},
 				Description: "Set of V-Net gateway entries. Each entry specifies a gateway CIDR for a V-Net identified by its postfix. Multiple entries with the same postfix enable dual-stack.",
 			},
+			"vnet_extra_gateway": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"postfix": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "V-Net name suffix (e.g. 'frontend').",
+						},
+						"gateway": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "Gateway CIDR (e.g. '10.100.8.1/22').",
+						},
+					},
+				},
+				Description: "More gateways on a V-Net, beside its vnet_gateway: a second subnet on the same segment. A server cluster creates the subnet of one gateway per V-Net and address family only, so these are added by a V-Net update after the cluster exists, and each one's subnet must already exist in the tenant's IPAM (a netris_subnet, purpose common, under the tenant's allocation).",
+			},
 			"vnet_dhcp_relay": {
 				Type:     schema.TypeSet,
 				Optional: true,
@@ -514,6 +533,42 @@ func resourceCreate(d *schema.ResourceData, m interface{}) error {
 		}
 	}
 
+	// Extra gateways: the cluster creates the subnet of one gateway per V-Net
+	// and family only, so the rest go on by a V-Net update, the created ones
+	// first (their subnets exist already, as the schema requires).
+	if extraSet, ok := d.GetOk("vnet_extra_gateway"); ok {
+		merged := mergeGateways(d.Get("vnet_gateway").(*schema.Set).List(), extraSet.(*schema.Set).List())
+		extras := groupGatewaysByPostfix(extraSet.(*schema.Set).List())
+		clusterName := d.Get("name").(string)
+
+		apiCluster, err := clientset.ServerCluster().GetByID(idStruct.ID)
+		if err != nil {
+			return fmt.Errorf("reading back cluster %d for extra gateways: %w", idStruct.ID, err)
+		}
+		if apiCluster == nil {
+			return fmt.Errorf("cluster %d not found after creation", idStruct.ID)
+		}
+
+		found := make(map[string]bool)
+		for _, v := range apiCluster.Resources.VNets {
+			postfix := v.Name
+			if strings.HasPrefix(v.Name, clusterName+"-") {
+				postfix = strings.TrimPrefix(v.Name, clusterName+"-")
+			}
+			if _, ok := extras[postfix]; ok {
+				found[postfix] = true
+				if err := replaceVNetGateways(clientset, v.ID, merged[postfix]); err != nil {
+					return fmt.Errorf("adding extra gateways to V-Net %q: %w", v.Name, err)
+				}
+			}
+		}
+		for postfix := range extras {
+			if !found[postfix] {
+				return fmt.Errorf("vnet_extra_gateway: cluster %q has no V-Net %q", clusterName, clusterName+"-"+postfix)
+			}
+		}
+	}
+
 	// Static port members (e.g. management servers) cannot be declared at
 	// cluster creation either. Merge them into the template V-Nets after
 	// creation, preserving dynamically programmed members.
@@ -634,6 +689,14 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 	for _, item := range configuredGWs {
 		configuredPostfixes[item.(map[string]interface{})["postfix"].(string)] = true
 	}
+	// Gateways declared as extra are read back into vnet_extra_gateway, the
+	// rest of a declared V-Net's into vnet_gateway.
+	configuredExtra := make(map[string]bool)
+	for _, item := range d.Get("vnet_extra_gateway").(*schema.Set).List() {
+		e := item.(map[string]interface{})
+		configuredPostfixes[e["postfix"].(string)] = true
+		configuredExtra[e["postfix"].(string)+"|"+e["gateway"].(string)] = true
+	}
 	configuredRelays := d.Get("vnet_dhcp_relay").(*schema.Set).List()
 	configuredRelayPostfixes := make(map[string]bool)
 	for _, item := range configuredRelays {
@@ -654,6 +717,7 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 
 	vnetIDs := make(map[string]string)
 	gwEntries := []interface{}{}
+	extraEntries := []interface{}{}
 	vnetDetails := []interface{}{}
 	relayEntries := []interface{}{}
 	portEntries := []interface{}{}
@@ -729,10 +793,15 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		// Populate vnet_gateway drift entries for configured postfixes
 		if configuredPostfixes[postfix] {
 			for _, gw := range gateways {
-				gwEntries = append(gwEntries, map[string]interface{}{
+				entry := map[string]interface{}{
 					"postfix": postfix,
 					"gateway": gw,
-				})
+				}
+				if configuredExtra[postfix+"|"+gw] {
+					extraEntries = append(extraEntries, entry)
+				} else {
+					gwEntries = append(gwEntries, entry)
+				}
 			}
 		}
 	}
@@ -742,6 +811,10 @@ func resourceRead(d *schema.ResourceData, m interface{}) error {
 		return err
 	}
 	err = d.Set("vnet_gateway", gwEntries)
+	if err != nil {
+		return err
+	}
+	err = d.Set("vnet_extra_gateway", extraEntries)
 	if err != nil {
 		return err
 	}
@@ -843,10 +916,11 @@ func resourceUpdate(d *schema.ResourceData, m interface{}) error {
 		return fmt.Errorf("%s", reply.Data)
 	}
 
-	if d.HasChange("vnet_gateway") {
-		old, new := d.GetChange("vnet_gateway")
-		oldByPostfix := groupGatewaysByPostfix(old.(*schema.Set).List())
-		newByPostfix := groupGatewaysByPostfix(new.(*schema.Set).List())
+	if d.HasChange("vnet_gateway") || d.HasChange("vnet_extra_gateway") {
+		oldGW, newGW := d.GetChange("vnet_gateway")
+		oldExtra, newExtra := d.GetChange("vnet_extra_gateway")
+		oldByPostfix := mergeGateways(oldGW.(*schema.Set).List(), oldExtra.(*schema.Set).List())
+		newByPostfix := mergeGateways(newGW.(*schema.Set).List(), newExtra.(*schema.Set).List())
 		clusterName := d.Get("name").(string)
 		vnetIDsMap := d.Get("vnet_ids").(map[string]interface{})
 
