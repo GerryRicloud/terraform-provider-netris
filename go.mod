@@ -88,4 +88,4 @@ require (
 	google.golang.org/protobuf v1.27.1 // indirect
 )
 
-replace github.com/netrisai/netriswebapi => /Users/gerry/ws/ricloud/dev/netriswebapi.git
+replace github.com/netrisai/netriswebapi => github.com/GerryRicloud/netriswebapi v0.0.0-20261126023208-4bc6b19e0476

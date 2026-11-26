@@ -432,12 +432,12 @@ func resourceCreate(d *schema.ResourceData, m interface{}) error {
 		vpc = &servercluster.IDName{ID: vpcID}
 	}
 
-	var ipv4Gateways []servercluster.GatewayInput
-	var ipv6Gateways []servercluster.GatewayInput
+	var ipv4Gateways []servercluster.VNetGatewayAssign
+	var ipv6Gateways []servercluster.VNetGatewayAssign
 	if gwSet, ok := d.GetOk("vnet_gateway"); ok {
 		for _, item := range gwSet.(*schema.Set).List() {
 			m := item.(map[string]interface{})
-			gw := servercluster.GatewayInput{
+			gw := servercluster.VNetGatewayAssign{
 				Postfix: m["postfix"].(string),
 				Address: m["gateway"].(string),
 			}
