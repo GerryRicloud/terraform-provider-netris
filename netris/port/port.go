@@ -63,7 +63,7 @@ func Resource() *schema.Resource {
 				ValidateFunc: validateBreakout,
 				Type:         schema.TypeString,
 				Optional:     true,
-				Description:  "Toggle breakout. Possible values: `off`, `4x10`, `4x25`, `4x100`, `manual`. Default value is `off`",
+				Description:  "Toggle breakout. Possible values: `off`, `2x200`, `4x10`, `4x25`, `4x100`, `manual`. Default value is `off`",
 			},
 			"mtu": {
 				Default:     9000,

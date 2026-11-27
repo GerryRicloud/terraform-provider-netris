@@ -25,8 +25,12 @@ import (
 
 func validateBreakout(val interface{}, key string) (warns []string, errs []error) {
 	v := val.(string)
-	if !(v == "off" || v == "4x10" || v == "4x25" || v == "4x100" || v == "manual") {
-		errs = append(errs, fmt.Errorf("Breakout available values are (off, 4x10, 4x25, 4x100, manual)"))
+	// 2x200: one 400G SN4700 port serving two 200G hosts (ConnectX-7 at
+	// 200GAUI-4). Assumed, not documented by Netris: the controller creates
+	// two children, <port>s0 and <port>s1. The value passes through to the
+	// controller unchanged, as the other modes do.
+	if !(v == "off" || v == "2x200" || v == "4x10" || v == "4x25" || v == "4x100" || v == "manual") {
+		errs = append(errs, fmt.Errorf("Breakout available values are (off, 2x200, 4x10, 4x25, 4x100, manual)"))
 		return warns, errs
 	}
 	return warns, errs
